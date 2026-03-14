@@ -7,6 +7,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
 <script>
 // Chart.js dark background plugin
 Chart.register({id:'customCanvasBackgroundColor',beforeDraw:(chart,args,options)=>{
@@ -240,6 +241,7 @@ table.tbl tr:hover td{background:var(--bg3);cursor:pointer}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:3px}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -527,10 +529,16 @@ table.tbl tr:hover td{background:var(--bg3);cursor:pointer}
             <span style="display:flex;align-items:center;gap:4px"><svg width="10" height="10" viewBox="0 0 10 10"><polygon points="0,0 10,0 5,10" fill="#f85149"/></svg> Entrada Short</span>
             <span style="display:flex;align-items:center;gap:4px"><svg width="10" height="10" viewBox="0 0 10 10"><polygon points="5,0 10,10 0,10" fill="#f0b429"/></svg> Salida Long</span>
             <span style="display:flex;align-items:center;gap:4px"><svg width="10" height="10" viewBox="0 0 10 10"><polygon points="0,0 10,0 5,10" fill="#ec407a"/></svg> Salida Short</span>
-            <span style="color:var(--muted2);font-size:10px">Scroll = zoom · Arrastrar = mover</span>
           </div>
         </div>
-        <canvas id="exec-canvas" style="width:100%;height:360px;border-radius:6px;background:var(--bg3);cursor:crosshair;display:block"></canvas>
+        <!-- Lightweight Charts container -->
+        <div id="tv-chart-wrap" style="position:relative;width:100%;height:500px;border-radius:6px;overflow:hidden">
+          <div id="tv-widget-container" style="width:100%;height:100%;background:#1c2128"></div>
+          <div id="tv-loading" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#1c2128;border-radius:6px;flex-direction:column;gap:10px">
+            <div style="color:#8b949e;font-size:14px">Cargando datos de mercado...</div>
+            <div style="width:32px;height:32px;border:2px solid var(--border);border-top-color:var(--green);border-radius:50%;animation:spin 1s linear infinite"></div>
+          </div>
+        </div>
         <canvas id="td-chart" style="width:100%;height:70px;border-radius:4px;background:var(--bg3);margin-top:6px;display:block"></canvas>
       </div>
       <div class="g22" style="margin-bottom:14px">
@@ -1201,48 +1209,41 @@ function openTD(id){
   document.getElementById('trades-list').style.display='none';
   document.getElementById('td-sym').textContent=t.symbol;
   document.getElementById('td-dt').textContent=`${t.date} ${t.time}`;
+  document.getElementById('td-notes').value=t.notes||'';
 
-  // ---- Correct P&L calculation (FIFO, same as parser) ----
+  // ---- Correct FIFO P&L ----
   let avgCost=0,pos=0,realizedPnl=0;
   const execAnnotations=[];
   t.execs.forEach(e=>{
     if(e.qty>0){
       avgCost=(avgCost*pos+e.price*e.qty)/(pos+e.qty);
       pos+=e.qty;
-      execAnnotations.push({...e,partialPnl:null,posAfter:pos,avgCostAfter:avgCost});
     }else{
-      const closeQty=Math.abs(e.qty);
-      const partial=closeQty*(e.price-avgCost);
-      realizedPnl+=partial;
-      pos+=e.qty; // e.qty is negative
-      execAnnotations.push({...e,partialPnl:partial,posAfter:pos,avgCostAfter:avgCost,isFinalClose:pos===0});
+      realizedPnl+=Math.abs(e.qty)*(e.price-avgCost);
+      pos+=e.qty;
+      if(pos===0)avgCost=0;
     }
+    execAnnotations.push({...e,posAfter:pos});
   });
+  const grossPnl=t.pnl;
 
-  // Use pre-calculated pnl from parser, but show realized here
-  const grossPnl=t.pnl; // trust the parser's value
   document.getElementById('td-pnl').textContent=fmt(grossPnl);
   document.getElementById('td-pnl').className='tstat-val '+(grossPnl>=0?'val-pos':'val-neg');
   document.getElementById('td-shr').textContent=t.volume.toLocaleString();
   document.getElementById('td-exc').textContent=t.executions;
-  document.getElementById('td-notes').value=t.notes||'';
 
-  // ---- Hold time: first exec to last exec ----
-  const parseTime=s=>{const p=s.split(' ');const tp=(p[1]||p[0]).split(':');return parseInt(tp[0])*3600+parseInt(tp[1])*60+(parseInt(tp[2])||0);};
-  const times=t.execs.map(e=>parseTime(e.dt));
-  const holdSec=Math.max(0,(Math.max(...times)-Math.min(...times)));
-  const holdMin=Math.round(holdSec/60);
-  const holdStr=holdSec<60?holdSec+'s':holdMin<60?holdMin+' min':`${Math.floor(holdMin/60)}h ${holdMin%60}m`;
+  // ---- Hold time ----
+  const toSec=s=>{const p=s.split(' ');const tp=(p[1]||p[0]).split(':');return parseInt(tp[0])*3600+parseInt(tp[1])*60+(parseInt(tp[2])||0);};
+  const times=t.execs.map(e=>toSec(e.dt));
+  const holdSec=Math.max(0,Math.max(...times)-Math.min(...times));
+  const holdStr=holdSec<60?holdSec+'s':holdSec<3600?Math.round(holdSec/60)+' min':`${Math.floor(holdSec/3600)}h ${Math.round((holdSec%3600)/60)}m`;
 
-  // ---- Entry/exit avg prices ----
-  const buyExecs=t.execs.filter(e=>e.qty>0);
-  const sellExecs=t.execs.filter(e=>e.qty<0);
-  const totalBuyQty=buyExecs.reduce((s,e)=>s+e.qty,0)||1;
-  const totalSellQty=sellExecs.reduce((s,e)=>s+Math.abs(e.qty),0)||1;
-  const avgEntry=buyExecs.reduce((s,e)=>s+e.price*e.qty,0)/totalBuyQty;
-  const avgExit=sellExecs.reduce((s,e)=>s+e.price*Math.abs(e.qty),0)/totalSellQty;
+  const buyEx=t.execs.filter(e=>e.qty>0),sellEx=t.execs.filter(e=>e.qty<0);
+  const tBuyQ=buyEx.reduce((s,e)=>s+e.qty,0)||1;
+  const tSellQ=sellEx.reduce((s,e)=>s+Math.abs(e.qty),0)||1;
+  const avgEntry=buyEx.reduce((s,e)=>s+e.price*e.qty,0)/tBuyQ;
+  const avgExit=sellEx.reduce((s,e)=>s+e.price*Math.abs(e.qty),0)/tSellQ;
 
-  // Stats box
   document.getElementById('td-stats-body').innerHTML=[
     ['Gross P&L',fmt(grossPnl),grossPnl>=0],
     ['Comisiones',fmt(-t.commissions),false],
@@ -1250,36 +1251,36 @@ function openTD(id){
     ['Hold Time',holdStr,null],
     ['Avg entrada','$'+avgEntry.toFixed(4),null],
     ['Avg salida','$'+avgExit.toFixed(4),null],
-  ].map(([l,v,p])=>`<div style="background:var(--bg2);padding:10px 14px"><div style="font-size:11px;color:var(--muted)">${l}</div><div style="font-size:14px;font-weight:600;font-family:var(--mono);margin-top:2px" class="${p===true?'val-pos':p===false?'val-neg':''}">${v}</div></div>`).join('');
+  ].map(([l,v,p])=>`<div style="background:var(--bg2);padding:10px 14px">
+    <div style="font-size:11px;color:var(--muted)">${l}</div>
+    <div style="font-size:14px;font-weight:600;font-family:var(--mono);margin-top:2px" class="${p===true?'val-pos':p===false?'val-neg':''}">${v}</div>
+  </div>`).join('');
 
-  // Draw the execution chart
-  drawExecChart(t, execAnnotations, grossPnl);
+  // ---- TradingView Widget ----
+  buildTVChart(t, execAnnotations, grossPnl);
 
-  // Running P&L mini chart
+  // ---- Running P&L mini chart ----
   dc('td-chart');
-  let cum2=0,avgC2=0,pos2=0;
-  const rlabels=[],rdata=[];
+  let cum=0,avgC=0,posC=0;
+  const rl=[],rd=[];
   t.execs.forEach((e,i)=>{
-    if(e.qty>0){avgC2=(avgC2*pos2+e.price*e.qty)/(pos2+e.qty);pos2+=e.qty;}
-    else{cum2+=Math.abs(e.qty)*(e.price-avgC2);pos2+=e.qty;}
-    rlabels.push(i+1);rdata.push(parseFloat(cum2.toFixed(4)));
+    if(e.qty>0){avgC=(avgC*posC+e.price*e.qty)/(posC+e.qty);posC+=e.qty;}
+    else{cum+=Math.abs(e.qty)*(e.price-avgC);posC+=e.qty;}
+    rl.push(i+1);rd.push(parseFloat(cum.toFixed(4)));
   });
   const c2=document.getElementById('td-chart');
   if(c2){
     c2.style.height='70px';
-    // Set canvas background to dark
-    c2.style.background='var(--bg3)';
     charts['td-chart']=new Chart(c2,{
       type:'line',
-      data:{labels:rlabels,datasets:[{data:rdata,borderColor:grossPnl>=0?'#3fb950':'#f85149',borderWidth:1.5,fill:false,tension:.3,pointRadius:0}]},
+      data:{labels:rl,datasets:[{data:rd,borderColor:grossPnl>=0?'#3fb950':'#f85149',borderWidth:1.5,fill:false,tension:.3,pointRadius:0}]},
       options:{responsive:true,maintainAspectRatio:false,animation:false,
-        plugins:{legend:{display:false},
-          customCanvasBackgroundColor:{color:'#1c2128'}},
+        plugins:{legend:{display:false},customCanvasBackgroundColor:{color:'#1c2128'}},
         scales:{x:{display:false},y:{ticks:{color:'#6e7681',font:{size:9},callback:v=>fmts(v)},grid:{color:'rgba(48,54,61,.4)'}}}}
     });
   }
 
-  // Executions table — show P&L only on final close of each round trip
+  // ---- Executions table ----
   let avgC3=0,pos3=0;
   document.getElementById('td-execs').innerHTML=t.execs.map(e=>{
     let pnlCell='—';
@@ -1287,335 +1288,190 @@ function openTD(id){
     else{const p=Math.abs(e.qty)*(e.price-avgC3);pos3+=e.qty;
       if(pos3===0){pnlCell=`<span class="${p>=0?'val-pos':'val-neg'}">${fmt(p)}</span>`;}
       else{pnlCell='<span style="color:var(--muted2)">parcial</span>';}
+      if(pos3===0)avgC3=0;
     }
-    const side=e.qty>0?'B':'S';
-    return `<tr><td style="font-family:var(--mono);font-size:11px">${e.dt}</td>
-      <td><span class="${side==='B'?'exec-buy':'exec-sell'}" style="font-weight:700">${side}</span></td>
+    return `<tr>
+      <td style="font-family:var(--mono);font-size:11px">${e.dt}</td>
+      <td><span class="${e.qty>0?'exec-buy':'exec-sell'}" style="font-weight:700">${e.qty>0?'B':'S'}</span></td>
       <td class="${e.qty>0?'exec-buy':'exec-sell'}" style="font-family:var(--mono)">${e.qty>0?'+':''}${e.qty}</td>
       <td style="font-family:var(--mono)">$${parseFloat(e.price).toFixed(4)}</td>
       <td style="font-family:var(--mono)">${e.pos}</td>
-      <td style="font-family:var(--mono)">${pnlCell}</td></tr>`;
+      <td>${pnlCell}</td>
+    </tr>`;
   }).join('');
 }
 
-// ---- EXECUTION CHART WITH ZOOM/PAN ----
-let ecState={zoom:1,offsetX:0,dragging:false,dragStartX:0,dragStartOffset:0,trade:null,annotations:[],bars:[],W:0,H:0,grossPnl:0,listenersAttached:false};
+let lwChart=null, lwSeries=null;
 
-function drawExecChart(t, annotations, grossPnl){
-  const canvas=document.getElementById('exec-canvas');
-  if(!canvas)return;
-  const dpr=window.devicePixelRatio||1;
-  const W=canvas.parentElement.clientWidth-32||700;
-  const H=360;
-  canvas.style.width=W+'px';canvas.style.height=H+'px';
-  canvas.width=W*dpr;canvas.height=H*dpr;
+function buildTVChart(t, annotations, grossPnl){
+  const container=document.getElementById('tv-widget-container');
+  const loading=document.getElementById('tv-loading');
+  if(!container)return;
 
-  // Reset state for new trade, preserve zoom if same trade
-  const sameTradeId=ecState.trade&&ecState.trade.id===t.id;
-  ecState.trade=t;
-  ecState.annotations=annotations;
-  ecState.grossPnl=grossPnl;
-  ecState.W=W;ecState.H=H;
-  if(!sameTradeId){ecState.zoom=1;ecState.offsetX=0;ecState.bars=[];}
+  // Destroy previous chart
+  if(lwChart){try{lwChart.remove();}catch(e){} lwChart=null; lwSeries=null;}
+  container.innerHTML='';
+  if(loading)loading.style.display='flex';
 
-  // Attach listeners only once
-  if(!ecState.listenersAttached){
-    canvas.addEventListener('wheel',ecOnWheel,{passive:false});
-    canvas.addEventListener('mousedown',ecOnMouseDown);
-    canvas.addEventListener('mousemove',ecOnMouseMove);
-    canvas.addEventListener('mouseup',ecOnMouseUp);
-    canvas.addEventListener('mouseleave',ecOnMouseUp);
-    ecState.listenersAttached=true;
-  }
-
-  // If we already have bars for this trade, just render
-  if(ecState.bars&&ecState.bars.length>0){
-    ecRender();
-    return;
-  }
-
-  // Show loading
-  const ctx=canvas.getContext('2d');
-  ctx.setTransform(dpr,0,0,dpr,0,0);
-  ctx.fillStyle='#1c2128';ctx.fillRect(0,0,W,H);
-  ctx.fillStyle='#8b949e';ctx.font='14px Inter,sans-serif';ctx.textAlign='center';
-  ctx.fillText('Cargando datos de mercado...', W/2, H/2);
-
-  // Fetch once, then render
-  fetchYahooCandles(t).then(bars=>{
-    // Only update if this is still the active trade
-    if(ecState.trade&&ecState.trade.id===t.id){
-      ecState.bars=bars;
-      ecRender();
-    }
+  // Fetch real candles from Massive API then render
+  fetchMassiveCandles(t).then(bars=>{
+    if(loading)loading.style.display='none';
+    renderLWChart(container, bars, t, annotations, grossPnl);
   }).catch(err=>{
-    if(!ecState.trade||ecState.trade.id!==t.id)return;
-    const c=document.getElementById('exec-canvas');
-    if(!c)return;
-    const ctx2=c.getContext('2d');
-    ctx2.setTransform(dpr,0,0,dpr,0,0);
-    ctx2.fillStyle='#1c2128';ctx2.fillRect(0,0,W,H);
-    const lines=['Error: '+err.message,'','Posibles causas:',
-      '• El símbolo no tiene datos en Massive/Polygon',
-      '• Sin datos históricos para esa fecha',
-      '• Abre el journal desde un servidor local (no file://)'];
-    lines.forEach((l,i)=>{
-      ctx2.fillStyle=i===0?'#f85149':i===2?'#8b949e':'#6e7681';
-      ctx2.font=(i===0?'bold ':'')+'12px Inter,sans-serif';
-      ctx2.textAlign='center';
-      ctx2.fillText(l,W/2,H/2-40+i*20);
-    });
+    if(loading){
+      loading.innerHTML=`<div style="color:#f85149;font-size:13px;text-align:center;padding:20px;line-height:1.6">
+        Sin datos: ${err.message}<br>
+        <span style="color:#6e7681;font-size:11px">Verifica que el símbolo existe en Massive/Polygon</span>
+      </div>`;
+    }
   });
 }
 
-async function fetchYahooCandles(t){
+function renderLWChart(container, bars, t, annotations, grossPnl){
+  const W=container.clientWidth||800;
+  const H=500;
+
+  // Create Lightweight Chart
+  lwChart=LightweightCharts.createChart(container,{
+    width:W, height:H,
+    layout:{background:{color:'#1c2128'},textColor:'#8b949e'},
+    grid:{vertLines:{color:'rgba(48,54,61,0.5)'},horzLines:{color:'rgba(48,54,61,0.5)'}},
+    crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
+    rightPriceScale:{borderColor:'#30363d'},
+    timeScale:{borderColor:'#30363d',timeVisible:true,secondsVisible:false},
+  });
+
+  // Candlestick series
+  lwSeries=lwChart.addCandlestickSeries({
+    upColor:'#3fb950', downColor:'#f85149',
+    borderUpColor:'#3fb950', borderDownColor:'#f85149',
+    wickUpColor:'#3fb950', wickDownColor:'#f85149',
+  });
+
+  // Set data — Lightweight Charts needs {time, open, high, low, close}
+  // time must be unix seconds (integer)
+  const chartData=bars.map(b=>({
+    time:Math.floor(b.t),
+    open:b.o, high:b.h, low:b.l, close:b.c
+  }));
+  lwSeries.setData(chartData);
+
+  // Build markers for Lightweight Charts
+  // Markers need: time (unix sec), position ('aboveBar'|'belowBar'), color, shape, text
+  const parseTS=s=>{
+    const parts=s.split(' ');
+    const d=parts.length>1?parts[0]:t.date;
+    const tm=parts.length>1?parts[1]:parts[0];
+    return Math.floor(new Date(d+'T'+tm).getTime()/1000);
+  };
+
+  // Find nearest bar time for each exec
+  const barTimes=chartData.map(b=>b.time);
+  const nearestBarTime=ts=>{
+    let best=barTimes[0], bestD=Infinity;
+    barTimes.forEach(bt=>{const d=Math.abs(bt-ts);if(d<bestD){bestD=d;best=bt;}});
+    return best;
+  };
+
+  // Calculate round-trip P&L for labels
+  let rtAvg=0,rtPos=0,rtAccum=0;
+  const rtMap={}; // barTime -> pnl label
+  annotations.forEach(ann=>{
+    const ts=parseTS(ann.dt);
+    const bt=nearestBarTime(ts);
+    if(ann.qty>0){rtAvg=(rtAvg*rtPos+ann.price*ann.qty)/(rtPos+ann.qty);rtPos+=ann.qty;}
+    else{rtAccum+=Math.abs(ann.qty)*(ann.price-rtAvg);rtPos+=ann.qty;
+      if(rtPos===0){rtMap[bt]=(rtMap[bt]||0)+rtAccum;rtAccum=0;rtAvg=0;}
+    }
+  });
+
+  // Build markers array
+  let dPos=0,dAvg=0;
+  const markersMap={}; // group by barTime to avoid duplicate markers
+  annotations.forEach(ann=>{
+    const ts=parseTS(ann.dt);
+    const bt=nearestBarTime(ts);
+    const isBuy=ann.qty>0;
+    let color,shape,position,text='';
+    if(isBuy){
+      color=dPos<0?'#ec407a':'#3fb950';
+      shape='arrowUp'; position='belowBar';
+      dAvg=(dAvg*dPos+ann.price*ann.qty)/(dPos+ann.qty);
+      dPos+=ann.qty;
+    }else{
+      color=dPos>0?'#f0b429':'#f85149';
+      shape='arrowDown'; position='aboveBar';
+      dPos+=ann.qty;
+      if(dPos===0){dAvg=0;}
+    }
+    // Add P&L text on round-trip close
+    if(rtMap[bt]!==undefined&&dPos===0){
+      const pnl=rtMap[bt];
+      text=(pnl>=0?'+':'')+pnl.toFixed(2);
+      delete rtMap[bt];
+    }
+    if(!markersMap[bt])markersMap[bt]=[];
+    markersMap[bt].push({time:bt,position,color,shape,text,size:1.5});
+  });
+
+  // Flatten and sort markers by time
+  const markers=Object.values(markersMap).flat().sort((a,b)=>a.time-b.time);
+  lwSeries.setMarkers(markers);
+
+  // Fit content to show the trade window
+  const execTimes=annotations.map(a=>parseTS(a.dt));
+  const tFrom=Math.min(...execTimes)-1800;
+  const tTo=Math.max(...execTimes)+1800;
+  lwChart.timeScale().setVisibleRange({from:tFrom, to:tTo});
+
+  // Resize observer
+  if(window.ResizeObserver){
+    const ro=new ResizeObserver(()=>{
+      if(lwChart&&container.clientWidth>0)lwChart.resize(container.clientWidth,H);
+    });
+    ro.observe(container);
+  }
+}
+
+async function fetchMassiveCandles(t){
   const MASSIVE_KEY='JfoWszFm_4ZM2vdlCTDx8fbEeWWKCAXd';
   const execs=t.execs;
   const parseTS=s=>{
     const parts=s.split(' ');
     const datePart=parts.length>1?parts[0]:t.date;
     const timePart=parts.length>1?parts[1]:parts[0];
-    return new Date(datePart+'T'+timePart).getTime();// milliseconds
+    return new Date(datePart+'T'+timePart).getTime();
   };
   const timestamps=execs.map(e=>parseTS(e.dt));
   const tMin=Math.min(...timestamps);
   const tMax=Math.max(...timestamps);
-  // extend window 60min before first exec and 60min after last
   const fromMs=tMin-60*60*1000;
   const toMs=tMax+60*60*1000;
   const fromDate=new Date(fromMs).toISOString().slice(0,10);
   const toDate=new Date(toMs).toISOString().slice(0,10);
   const sym=t.symbol;
-  // Use CORS proxy to bypass browser restrictions on local HTML files
-  const apiUrl=`https://api.massive.com/v2/aggs/ticker/${sym}/range/1/minute/${fromDate}/${toDate}?limit=1000&sort=asc&adjusted=false&apiKey=${MASSIVE_KEY}`;
-  // Try direct first, fall back to proxy
-  let resp;
-  try{
-    resp=await fetch(apiUrl,{mode:'cors'});
-    if(!resp.ok)throw new Error('direct failed');
-  }catch(e){
-    resp=await fetch(`https://corsproxy.io/?url=${encodeURIComponent(apiUrl)}`);
-  }
-  if(!resp.ok) throw new Error(`HTTP ${resp.status} - ${await resp.text()}`);
+  const url=`https://api.massive.com/v2/aggs/ticker/${sym}/range/1/minute/${fromDate}/${toDate}?limit=1000&sort=asc&adjusted=false&apiKey=${MASSIVE_KEY}`;
+  const resp=await fetch(url);
+  if(!resp.ok)throw new Error(`HTTP ${resp.status}`);
   const json=await resp.json();
-  if(json.status==='ERROR') throw new Error(json.error||'API error');
+  if(json.status==='ERROR')throw new Error(json.error||'API error');
   const results=json.results;
-  if(!results||!results.length) throw new Error('Sin datos de mercado para '+sym+' en '+fromDate);
-  // Massive timestamps are in milliseconds
-  const bars=results
+  if(!results||!results.length)throw new Error('Sin datos para '+sym+' ('+fromDate+')');
+  return results
     .filter(r=>r.t>=fromMs&&r.t<=toMs)
-    .map(r=>({
-      t:r.t/1000,// store as seconds
-      o:r.o, h:r.h, l:r.l, c:r.c, v:r.v,
-      label:new Date(r.t).toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})
-    }));
-  if(!bars.length) throw new Error('Sin velas en el rango del trade ('+fromDate+' '+fromMs+' a '+toMs+')');
-  return bars;
-}
-function ecOnWheel(e){
-  e.preventDefault();
-  const rect=e.currentTarget.getBoundingClientRect();
-  const mouseX=e.clientX-rect.left;
-  const ML=60;
-  const relX=mouseX-ML;
-  const delta=e.deltaY>0?0.8:1.25;
-  const newZoom=Math.max(0.3,Math.min(30,ecState.zoom*delta));
-  // Zoom centered on mouse
-  ecState.offsetX=(ecState.offsetX-relX)*newZoom/ecState.zoom+relX;
-  ecState.zoom=newZoom;
-  ecRender();
-}
-function ecOnMouseDown(e){ecState.dragging=true;ecState.dragStartX=e.clientX;ecState.dragStartOffset=ecState.offsetX;}
-function ecOnMouseMove(e){if(!ecState.dragging)return;ecState.offsetX=ecState.dragStartOffset+(e.clientX-ecState.dragStartX);ecRender();}
-function ecOnMouseUp(){ecState.dragging=false;}
-
-function ecRender(){
-  const {trade:t,annotations,grossPnl,zoom,W,H,bars}=ecState;
-  if(!t)return;
-  const canvas=document.getElementById('exec-canvas');
-  if(!canvas)return;
-  const dpr=window.devicePixelRatio||1;
-  const ctx=canvas.getContext('2d');
-  ctx.setTransform(dpr,0,0,dpr,0,0);
-  ctx.clearRect(0,0,W,H);
-
-  const ML=60,MR=16,MT=24,MB=36;
-  const chartW=W-ML-MR,chartH=H-MT-MB;
-
-  ctx.fillStyle='#1c2128';ctx.fillRect(0,0,W,H);
-
-  if(!bars||!bars.length){
-    ctx.fillStyle='#8b949e';ctx.font='13px Inter,sans-serif';ctx.textAlign='center';
-    ctx.fillText('Sin datos de mercado',W/2,H/2);return;
-  }
-
-  const N=bars.length;
-  const barStep=(chartW/Math.min(N,80))*zoom;
-  const visibleN=Math.floor(chartW/barStep);
-  const maxOffset=Math.max(0,(N-visibleN-1)*barStep);
-  ecState.offsetX=Math.min(0,Math.max(-maxOffset,ecState.offsetX));
-  const offsetX=ecState.offsetX;
-
-  const toX=i=>ML+offsetX+i*barStep+barStep/2;
-
-  // Visible range
-  const visStart=Math.max(0,Math.floor(-offsetX/barStep)-1);
-  const visEnd=Math.min(N-1,visStart+visibleN+2);
-  const visH=bars.slice(visStart,visEnd+1).map(b=>b.h);
-  const visL=bars.slice(visStart,visEnd+1).map(b=>b.l);
-  const yMax=Math.max(...visH)*1.005;
-  const yMin=Math.min(...visL)*0.995;
-  const yRange=yMax-yMin||0.001;
-  const toY=p=>MT+chartH*(1-(p-yMin)/yRange);
-
-  // Grid
-  ctx.strokeStyle='rgba(48,54,61,0.7)';ctx.lineWidth=1;
-  ctx.fillStyle='#6e7681';ctx.font=`10px 'JetBrains Mono',monospace`;ctx.textAlign='right';
-  const yTicks=6;
-  for(let i=0;i<=yTicks;i++){
-    const yv=yMin+yRange*i/yTicks;
-    const y=toY(yv);
-    if(y<MT-2||y>MT+chartH+2)continue;
-    ctx.beginPath();ctx.moveTo(ML,y);ctx.lineTo(W-MR,y);ctx.stroke();
-    ctx.fillText('$'+yv.toFixed(3),ML-4,y+3);
-  }
-
-  // Candles
-  const bw=Math.max(1,Math.min(barStep*0.7,20));
-  bars.forEach((b,i)=>{
-    const x=toX(i);
-    if(x<ML-bw||x>W-MR+bw)return;
-    const isGreen=b.c>=b.o;
-    const col=isGreen?'#3fb950':'#f85149';
-    ctx.strokeStyle=col;ctx.fillStyle=col;ctx.lineWidth=1;
-    // Wick
-    ctx.beginPath();ctx.moveTo(x,toY(b.h));ctx.lineTo(x,toY(b.l));ctx.stroke();
-    // Body
-    const by=toY(Math.max(b.o,b.c));
-    const bh=Math.max(1,Math.abs(toY(b.o)-toY(b.c)));
-    ctx.fillRect(x-bw/2,by,bw,bh);
-  });
-
-  // Map exec timestamp → bar index
-  const parseTS=s=>{
-    const parts=s.split(' ');
-    const datePart=parts.length>1?parts[0]:t.date;
-    const timePart=parts.length>1?parts[1]:parts[0];
-    return Math.floor(new Date(datePart+'T'+timePart).getTime()/1000);
-  };
-
-  const findBarIdx=ts=>{
-    let best=0,bestDiff=Infinity;
-    bars.forEach((b,i)=>{const d=Math.abs(b.t-ts);if(d<bestDiff){bestDiff=d;best=i;}});
-    return best;
-  };
-
-  // Clip for markers
-  ctx.save();ctx.beginPath();ctx.rect(ML,MT,chartW,chartH);ctx.clip();
-
-  const SZ=10;
-
-  // Pass 1: compute round-trip P&L labels
-  let rtAvg=0,rtPos=0,rtAccum=0;
-  const rtLabels=[];
-  annotations.forEach(ann=>{
-    const ts=parseTS(ann.dt);
-    const bi=findBarIdx(ts);
-    const x=toX(bi);
-    if(ann.qty>0){
-      rtAvg=(rtAvg*rtPos+ann.price*ann.qty)/(rtPos+ann.qty);
-      rtPos+=ann.qty;
-    }else{
-      rtAccum+=Math.abs(ann.qty)*(ann.price-rtAvg);
-      rtPos+=ann.qty;
-      if(rtPos===0){
-        rtLabels.push({x,price:ann.price,pnl:rtAccum});
-        rtAccum=0;rtAvg=0;
-      }
-    }
-  });
-
-  // Pass 2: draw triangles
-  let dPos=0,dAvg=0;
-  annotations.forEach(ann=>{
-    const ts=parseTS(ann.dt);
-    const bi=findBarIdx(ts);
-    const x=toX(bi);
-    const py=toY(ann.price);
-    let color;
-    if(ann.qty>0){
-      color=dPos<0?'#ec407a':'#3fb950';
-      dAvg=(dAvg*dPos+ann.price*ann.qty)/(dPos+ann.qty);
-      dPos+=ann.qty;
-    }else{
-      color=dPos>0?'#f0b429':'#f85149';
-      dPos+=ann.qty;
-      if(dPos===0)dAvg=0;
-    }
-    const isBuy=ann.qty>0;
-    ctx.fillStyle=color;ctx.strokeStyle='rgba(0,0,0,0.4)';ctx.lineWidth=0.8;
-    ctx.beginPath();
-    if(isBuy){ctx.moveTo(x,py+SZ);ctx.lineTo(x-SZ,py+SZ*2.4);ctx.lineTo(x+SZ,py+SZ*2.4);}
-    else{ctx.moveTo(x,py-SZ);ctx.lineTo(x-SZ,py-SZ*2.4);ctx.lineTo(x+SZ,py-SZ*2.4);}
-    ctx.closePath();ctx.fill();ctx.stroke();
-  });
-
-  // Pass 3: P&L labels on round-trip close
-  rtLabels.forEach(rt=>{
-    if(rt.x<ML||rt.x>W-MR)return;
-    const py=toY(rt.price);
-    const lbl=fmt(rt.pnl);
-    ctx.font=`600 11px 'JetBrains Mono',monospace`;
-    const tw=ctx.measureText(lbl).width;
-    const lw=tw+16,lh=20;
-    const ly=py+SZ*3+14;
-    const lx=Math.max(ML+lw/2,Math.min(W-MR-lw/2,rt.x));
-    ctx.fillStyle=rt.pnl>=0?'rgba(63,185,80,0.2)':'rgba(248,81,73,0.2)';
-    ctx.strokeStyle=rt.pnl>=0?'#3fb950':'#f85149';ctx.lineWidth=1;
-    roundRect(ctx,lx-lw/2,ly-lh/2,lw,lh,4);ctx.fill();ctx.stroke();
-    ctx.fillStyle=rt.pnl>=0?'#3fb950':'#f85149';ctx.textAlign='center';
-    ctx.fillText(lbl,lx,ly+4);
-  });
-
-  // Total top-right
-  const tl=`Total: ${fmt(grossPnl)}`;
-  ctx.font=`700 11px 'JetBrains Mono',monospace`;
-  const tlw2=ctx.measureText(tl).width+16;
-  ctx.fillStyle=grossPnl>=0?'rgba(63,185,80,0.15)':'rgba(248,81,73,0.15)';
-  ctx.strokeStyle=grossPnl>=0?'#3fb950':'#f85149';ctx.lineWidth=1;
-  roundRect(ctx,W-MR-tlw2-4,MT+4,tlw2,22,4);ctx.fill();ctx.stroke();
-  ctx.fillStyle=grossPnl>=0?'#3fb950':'#f85149';ctx.textAlign='center';
-  ctx.fillText(tl,W-MR-tlw2/2-4,MT+18);
-
-  ctx.restore();
-
-  // X axis labels
-  ctx.fillStyle='#6e7681';ctx.font=`9px 'Inter',sans-serif`;ctx.textAlign='center';
-  let lastLX=-999;
-  bars.forEach((b,i)=>{
-    const x=toX(i);
-    if(x<ML||x>W-MR||x-lastLX<55)return;
-    ctx.fillText(b.label,x,H-MB+14);lastLX=x;
-  });
-}
-
-
-function roundRect(ctx,x,y,w,h,r){
-  ctx.beginPath();ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
-  ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
-  ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
-  ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();
+    .map(r=>({t:r.t/1000,o:r.o,h:r.h,l:r.l,c:r.c,v:r.v}));
 }
 
 function closeTD(){
   if(activeTD)activeTD.notes=document.getElementById('td-notes').value||'';
   document.getElementById('trade-detail').classList.remove('active');
   document.getElementById('trades-list').style.display='block';
-  // Reset chart state for next trade
-  ecState.trade=null;ecState.bars=[];ecState.zoom=1;ecState.offsetX=0;
-  ecState.listenersAttached=false;
+  if(lwChart){try{lwChart.remove();}catch(e){} lwChart=null; lwSeries=null;}
+  const container=document.getElementById('tv-widget-container');
+  if(container)container.innerHTML='';
   activeTD=null;
 }
+
 
 
 // ===== JOURNAL =====
