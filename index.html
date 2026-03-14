@@ -1359,12 +1359,181 @@ function renderLWChart(container, bars, t, annotations, grossPnl){
   }));
   lwSeries.setData(chartData);
 
-  // Parse exec times as Eastern Time (EDT = UTC-4 in March)
+  // Parse exec timestamps to Unix seconds (UTC)
+  // Propreports times are in US Eastern (EDT=UTC-4 in March/Apr, EST=UTC-5 Nov-Mar)
+  // Trade date: t.date e.g. "2026-03-12" — March = EDT = UTC-4
   const parseTS=s=>{
     const parts=s.split(' ');
     const d=parts.length>1?parts[0]:t.date;
     const tm=parts.length>1?parts[1]:parts[0];
-    return Math.floor(new Date(d+'T'+tm+'-04:00').getTime()/1000);
+    // Detect DST: EDT (UTC-4) Mar 2nd Sunday to Nov 1st Sunday
+    const dt=new Date(d+'T'+tm+'Z');
+    const month=dt.getUTCMonth()+1;
+    const offset=(month>=3&&month<=10)?4:5; // EDT=4, EST=5
+    return Math.floor((dt.getTime()+offset*3600000)/1000);
+  };
+
+  // Find nearest bar time for each exec
+  const barTimes=chartData.map(b=>b.time);
+  const nearestBarTime=ts=>{
+    let best=barTimes[0], bestD=Infinity;
+    barTimes.forEach(bt=>{const d=Math.abs(bt-ts);if(d<bestD){bestD=d;best=bt;}});
+    return best;
+  };
+
+  // Calculate round-trip P&L for labels
+  let rtAvg=0,rtPos=0,rtAccum=0;
+  const rtMap={}; // barTime -> pnl label
+  annotations.forEach(ann=>{
+    const ts=parseTS(ann.dt);
+    const bt=nearestBarTime(ts);
+    if(ann.qty>0){rtAvg=(rtAvg*rtPos+ann.price*ann.qty)/(rtPos+ann.qty);rtPos+=ann.qty;}
+    else{rtAccum+=Math.abs(ann.qty)*(ann.price-rtAvg);rtPos+=ann.qty;
+      if(rtPos===0){rtMap[bt]=(rtMap[bt]||0)+rtAccum;rtAccum=0;rtAvg=0;}
+    }
+  });
+
+  // Build markers array
+  let dPos=0,dAvg=0;
+  const markersMap={}; // group by barTime to avoid duplicate markers
+  annotations.forEach(ann=>{
+    const ts=parseTS(ann.dt);
+    const bt=nearestBarTime(ts);
+    const isBuy=ann.qty>0;
+    let color,shape,position,text='';
+    if(isBuy){
+      color=dPos<0?'#ec407a':'#3fb950';
+      shape='arrowUp'; position='belowBar';
+      dAvg=(dAvg*dPos+ann.price*ann.qty)/(dPos+ann.qty);
+      dPos+=ann.qty;
+    }else{
+      color=dPos>0?'#f0b429':'#f85149';
+      shape='arrowDown'; position='aboveBar';
+      dPos+=ann.qty;
+      if(dPos===0){dAvg=0;}
+    }
+    // Add P&L text on round-trip close
+    if(rtMap[bt]!==undefined&&dPos===0){
+      const pnl=rtMap[bt];
+      text=(pnl>=0?'+':'')+pnl.toFixed(2);
+      delete rtMap[bt];
+    }
+    if(!markersMap[bt])markersMap[bt]=[];
+    markersMap[bt].push({time:bt,position,color,shape,text,size:1.5});
+  });
+
+  // Flatten and sort markers by time
+  const markers=Object.values(markersMap).flat().sort((a,b)=>a.time-b.time);
+  lwSeries.setMarkers(markers);
+  lwChart._tradeId=t.id; // mark so we don't rebuild unnecessarily
+
+  // Fit content to show the trade window
+  const execTimes=annotations.map(a=>parseTS(a.dt));
+  const tFrom=Math.min(...execTimes)-1800;
+  const tTo=Math.max(...execTimes)+1800;
+  lwChart.timeScale().setVisibleRange({from:tFrom, to:tTo});
+
+  // Resize observer
+  if(window.ResizeObserver){
+    const ro=new ResizeObserver(()=>{
+      if(lwChart&&container.clientWidth>0)lwChart.resize(container.clientWidth,H);
+    });
+    ro.observe(container);
+  }
+}
+
+async function fetchMassiveCandles(t){
+  const MASSIVE_KEY='JfoWszFm_4ZM2vdlCTDx8fbEeWWKCAXd';
+  const sym=t.symbol;
+  // Use the trade date directly — fetch the full day plus day before/after for safety
+  const tradeDate=t.date; // "2026-03-12"
+  const d=new Date(tradeDate+'T12:00:00Z');
+  const dayBefore=new Date(d-86400000).toISOString().slice(0,10);
+  const dayAfter=new Date(d.getTime()+86400000).toISOString().slice(0,10);
+
+  const url=`https://api.massive.com/v2/aggs/ticker/${sym}/range/1/minute/${dayBefore}/${dayAfter}?limit=2000&sort=asc&adjusted=false&apiKey=${MASSIVE_KEY}`;
+  const resp=await fetch(url);
+  if(!resp.ok)throw new Error(`HTTP ${resp.status}`);
+  const json=await resp.json();
+  if(json.status==='ERROR')throw new Error(json.error||'API error');
+  const results=json.results;
+  if(!results||!results.length)throw new Error('Sin datos para '+sym+' el '+tradeDate);
+  console.log('Massive returned',results.length,'bars for',sym,'first:',results[0].t,'last:',results[results.length-1].t);
+  // Return all bars — t in seconds for LW Charts
+  return results.map(r=>({t:Math.floor(r.t/1000),o:r.o,h:r.h,l:r.l,c:r.c,v:r.v}));
+}
+
+
+let lwChart=null, lwSeries=null;
+
+function buildTVChart(t, annotations, grossPnl){
+  const container=document.getElementById('tv-widget-container');
+  const loading=document.getElementById('tv-loading');
+  if(!container)return;
+
+  // Don't rebuild if same trade already loaded
+  if(lwChart&&lwChart._tradeId===t.id){return;}
+
+  // Destroy previous chart
+  if(lwChart){try{lwChart.remove();}catch(e){} lwChart=null; lwSeries=null;}
+  container.innerHTML='';
+  if(loading)loading.style.display='flex';
+
+  // Fetch real candles from Massive API then render
+  fetchMassiveCandles(t).then(bars=>{
+    if(loading)loading.style.display='none';
+    renderLWChart(container, bars, t, annotations, grossPnl);
+  }).catch(err=>{
+    if(loading){
+      loading.innerHTML=`<div style="color:#f85149;font-size:13px;text-align:center;padding:20px;line-height:1.6">
+        Sin datos: ${err.message}<br>
+        <span style="color:#6e7681;font-size:11px">Verifica que el símbolo existe en Massive/Polygon</span>
+      </div>`;
+    }
+  });
+}
+
+function renderLWChart(container, bars, t, annotations, grossPnl){
+  const W=container.clientWidth||800;
+  const H=500;
+
+  // Create Lightweight Chart
+  lwChart=LightweightCharts.createChart(container,{
+    width:W, height:H,
+    layout:{background:{color:'#1c2128'},textColor:'#8b949e'},
+    grid:{vertLines:{color:'rgba(48,54,61,0.5)'},horzLines:{color:'rgba(48,54,61,0.5)'}},
+    crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
+    rightPriceScale:{borderColor:'#30363d'},
+    timeScale:{borderColor:'#30363d',timeVisible:true,secondsVisible:false},
+  });
+
+  // Candlestick series
+  lwSeries=lwChart.addCandlestickSeries({
+    upColor:'#3fb950', downColor:'#f85149',
+    borderUpColor:'#3fb950', borderDownColor:'#f85149',
+    wickUpColor:'#3fb950', wickDownColor:'#f85149',
+  });
+
+  // Set data — Lightweight Charts needs {time, open, high, low, close}
+  // time must be unix seconds (integer)
+  const chartData=bars.map(b=>({
+    time:Math.floor(b.t),
+    open:b.o, high:b.h, low:b.l, close:b.c
+  }));
+  lwSeries.setData(chartData);
+
+  // Parse exec timestamps to Unix seconds (UTC)
+  // Propreports times are in US Eastern (EDT=UTC-4 in March/Apr, EST=UTC-5 Nov-Mar)
+  // Trade date: t.date e.g. "2026-03-12" — March = EDT = UTC-4
+  const parseTS=s=>{
+    const parts=s.split(' ');
+    const d=parts.length>1?parts[0]:t.date;
+    const tm=parts.length>1?parts[1]:parts[0];
+    // Detect DST: EDT (UTC-4) Mar 2nd Sunday to Nov 1st Sunday
+    const dt=new Date(d+'T'+tm+'Z');
+    const month=dt.getUTCMonth()+1;
+    const offset=(month>=3&&month<=10)?4:5; // EDT=4, EST=5
+    return Math.floor((dt.getTime()+offset*3600000)/1000);
   };
 
   // Find nearest bar time for each exec
